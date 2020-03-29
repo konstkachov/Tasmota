@@ -164,7 +164,7 @@ void MqttDiscoverServer(void)
 
 // Max message size calculated by PubSubClient is (MQTT_MAX_PACKET_SIZE < 5 + 2 + strlen(topic) + plength)
 #if (MQTT_MAX_PACKET_SIZE -TOPSZ -7) < MIN_MESSZ  // If the max message size is too small, throw an error at compile time. See PubSubClient.cpp line 359
-  #error "MQTT_MAX_PACKET_SIZE is too small in libraries/PubSubClient/src/PubSubClient.h, increase it to at least 1000"
+  #error "MQTT_MAX_PACKET_SIZE is too small in libraries/PubSubClient/src/PubSubClient.h, increase it to at least 1200"
 #endif
 
 #ifdef USE_MQTT_TLS
@@ -314,7 +314,7 @@ void MqttPublish(const char* topic, bool retained)
   ShowFreeMem(PSTR("MqttPublish"));
 #endif
 
-#if defined(USE_MQTT_TLS) && defined(USE_MQTT_AWS_IOT)
+#if defined(USE_MQTT_TLS) && defined(USE_MQTT_AWS_IOT) || defined(MQTT_NO_RETAIN)
 //  if (retained) {
 //    AddLog_P(LOG_LEVEL_INFO, S_LOG_MQTT, PSTR("Retained are not supported by AWS IoT, using retained = false."));
 //  }
@@ -398,7 +398,7 @@ void MqttPublishPrefixTopic_P(uint32_t prefix, const char* subtopic, bool retain
     free(mqtt_save);
 
     bool result = MqttClient.publish(romram, mqtt_data, false);
-    AddLog_P2(LOG_LEVEL_INFO, PSTR(D_LOG_MQTT "Updated shadow: %s"), romram);
+    AddLog_P2(LOG_LEVEL_DEBUG, PSTR(D_LOG_MQTT "Updated shadow: %s"), romram);
     yield();  // #3313
   }
 #endif // USE_MQTT_AWS_IOT
@@ -510,8 +510,14 @@ void MqttConnected(void)
     GetTopic_P(stopic, CMND, mqtt_topic, PSTR("#"));
     MqttSubscribe(stopic);
     if (strstr_P(SettingsText(SET_MQTT_FULLTOPIC), MQTT_TOKEN_TOPIC) != nullptr) {
-      GetGroupTopic_P(stopic, PSTR("#"));  // SetOption75 0: %prefix%/nothing/%topic% = cmnd/nothing/<grouptopic>/# or SetOption75 1: cmnd/<grouptopic>
-      MqttSubscribe(stopic);
+      uint32_t real_index = SET_MQTT_GRP_TOPIC;
+      for (uint32_t i = 0; i < MAX_GROUP_TOPICS; i++) {
+        if (1 == i) { real_index = SET_MQTT_GRP_TOPIC2 -1; }
+        if (strlen(SettingsText(real_index +i))) {
+          GetGroupTopic_P(stopic, PSTR("#"), real_index +i);  // SetOption75 0: %prefix%/nothing/%topic% = cmnd/nothing/<grouptopic>/# or SetOption75 1: cmnd/<grouptopic>
+          MqttSubscribe(stopic);
+        }
+      }
       GetFallbackTopic_P(stopic, PSTR("#"));
       MqttSubscribe(stopic);
     }
@@ -522,7 +528,7 @@ void MqttConnected(void)
   if (Mqtt.initial_connection_state) {
     char stopic2[TOPSZ];
     Response_P(PSTR("{\"" D_CMND_MODULE "\":\"%s\",\"" D_JSON_VERSION "\":\"%s%s\",\"" D_JSON_FALLBACKTOPIC "\":\"%s\",\"" D_CMND_GROUPTOPIC "\":\"%s\"}"),
-      ModuleName().c_str(), my_version, my_image, GetFallbackTopic_P(stopic, ""), GetGroupTopic_P(stopic2, ""));
+      ModuleName().c_str(), my_version, my_image, GetFallbackTopic_P(stopic, ""), GetGroupTopic_P(stopic2, "", SET_MQTT_GRP_TOPIC));
     MqttPublishPrefixTopic_P(TELE, PSTR(D_RSLT_INFO "1"));
 #ifdef USE_WEBSERVER
     if (Settings.webserver) {
@@ -712,6 +718,16 @@ void MqttCheck(void)
   }
 }
 
+bool KeyTopicActive(uint32_t key)
+{
+  // key = 0 - Button topic
+  // key = 1 - Switch topic
+  key &= 1;
+  char key_topic[TOPSZ];
+  Format(key_topic, SettingsText(SET_MQTT_BUTTON_TOPIC + key), sizeof(key_topic));
+  return ((strlen(key_topic) != 0) && strcmp(key_topic, "0"));
+}
+
 /*********************************************************************************************\
  * Commands
 \*********************************************************************************************/
@@ -871,13 +887,52 @@ void CmndPublish(void)
 
 void CmndGroupTopic(void)
 {
-  if (XdrvMailbox.data_len > 0) {
-    MakeValidMqtt(0, XdrvMailbox.data);
-    if (!strcmp(XdrvMailbox.data, mqtt_client)) { SetShortcutDefault(); }
-    SettingsUpdateText(SET_MQTT_GRP_TOPIC, (SC_DEFAULT == Shortcut()) ? MQTT_GRPTOPIC : XdrvMailbox.data);
-    restart_flag = 2;
+  if ((XdrvMailbox.index > 0) && (XdrvMailbox.index <= MAX_GROUP_TOPICS)) {
+    if (XdrvMailbox.data_len > 0) {
+      uint32_t settings_text_index = (1 == XdrvMailbox.index) ? SET_MQTT_GRP_TOPIC : SET_MQTT_GRP_TOPIC2 + XdrvMailbox.index - 2;
+      MakeValidMqtt(0, XdrvMailbox.data);
+      if (!strcmp(XdrvMailbox.data, mqtt_client)) { SetShortcutDefault(); }
+      SettingsUpdateText(settings_text_index, (SC_CLEAR == Shortcut()) ? "" : (SC_DEFAULT == Shortcut()) ? MQTT_GRPTOPIC : XdrvMailbox.data);
+
+      // Eliminate duplicates, have at least one and fill from index 1
+      char stemp[MAX_GROUP_TOPICS][TOPSZ];
+      uint32_t read_index = 0;
+      uint32_t real_index = SET_MQTT_GRP_TOPIC;
+      for (uint32_t i = 0; i < MAX_GROUP_TOPICS; i++) {
+        if (1 == i) { real_index = SET_MQTT_GRP_TOPIC2 -1; }
+        if (strlen(SettingsText(real_index +i))) {
+          bool not_equal = true;
+          for (uint32_t j = 0; j < read_index; j++) {
+            if (!strcmp(SettingsText(real_index +i), stemp[j])) {  // Topics are case-sensitive
+              not_equal = false;
+            }
+          }
+          if (not_equal) {
+            strncpy(stemp[read_index], SettingsText(real_index +i), sizeof(stemp[read_index]));
+            read_index++;
+          }
+        }
+      }
+      if (0 == read_index) {
+        SettingsUpdateText(SET_MQTT_GRP_TOPIC, MQTT_GRPTOPIC);
+      } else {
+        uint32_t write_index = 0;
+        uint32_t real_index = SET_MQTT_GRP_TOPIC;
+        for (uint32_t i = 0; i < MAX_GROUP_TOPICS; i++) {
+          if (1 == i) { real_index = SET_MQTT_GRP_TOPIC2 -1; }
+          if (write_index < read_index) {
+            SettingsUpdateText(real_index +i, stemp[write_index]);
+            write_index++;
+          } else {
+            SettingsUpdateText(real_index +i, "");
+          }
+        }
+      }
+
+      restart_flag = 2;
+    }
+    ResponseCmndAll(SET_MQTT_GRP_TOPIC, MAX_GROUP_TOPICS);
   }
-  ResponseCmndChar(SettingsText(SET_MQTT_GRP_TOPIC));
 }
 
 void CmndTopic(void)

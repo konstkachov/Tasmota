@@ -277,6 +277,23 @@ bool RtcRebootValid(void)
 
 /*********************************************************************************************\
  * Config - Flash
+ *
+ * Tasmota 1M flash usage
+ * 0x00000000 - Unzipped binary bootloader
+ * 0x00001000 - Unzipped binary code start
+ *    ::::
+ * 0x000xxxxx - Unzipped binary code end
+ * 0x000x1000 - First page used by Core OTA
+ *    ::::
+ * 0x000F3000 - Tasmota Quick Power Cycle counter (SETTINGS_LOCATION - CFG_ROTATES) - First four bytes only
+ * 0x000F4000 - First Tasmota rotating settings page
+ *    ::::
+ * 0x000FA000 - Last Tasmota rotating settings page = Last page used by Core OTA
+ * 0x000FB000 - Core SPIFFS end = Core EEPROM = Tasmota settings page during OTA and when no flash rotation is active (SETTINGS_LOCATION)
+ * 0x000FC000 - SDK - Uses first 128 bytes for phy init data mirrored by Core in RAM. See core_esp8266_phy.cpp phy_init_data[128] = Core user_rf_cal_sector
+ * 0x000FD000 - SDK - Uses scattered bytes from 0x340 (iTead use as settings storage from 0x000FD000)
+ * 0x000FE000 - SDK - Uses scattered bytes from 0x340 (iTead use as mirrored settings storage from 0x000FE000)
+ * 0x000FF000 - SDK - Uses at least first 32 bytes of this page - Tasmota Zigbee persistence from 0x000FF800 to 0x000FFFFF
 \*********************************************************************************************/
 
 extern "C" {
@@ -572,6 +589,12 @@ char* SettingsText(uint32_t index)
  * Config Save - Save parameters to Flash ONLY if any parameter has changed
 \*********************************************************************************************/
 
+void UpdateBackwardCompatibility(void)
+{
+  // Perform updates for backward compatibility
+  strlcpy(Settings.user_template_name, SettingsText(SET_TEMPLATE_NAME), sizeof(Settings.user_template_name));
+}
+
 uint32_t GetSettingsAddress(void)
 {
   return settings_location * SPI_FLASH_SEC_SIZE;
@@ -588,6 +611,7 @@ void SettingsSave(uint8_t rotate)
  * stop_flash_rotate 1 = Allow only eeprom flash slot use (SetOption12 1)
  */
 #ifndef FIRMWARE_MINIMAL
+  UpdateBackwardCompatibility();
   if ((GetSettingsCrc32() != settings_crc32) || rotate) {
     if (1 == rotate) {   // Use eeprom flash slot only and disable flash rotate from now on (upgrade)
       stop_flash_rotate = 1;
@@ -728,6 +752,7 @@ void SettingsErase(uint8_t type)
     1 = Erase 16k SDK parameter area near end of flash as seen by SDK (0x0xFCxxx - 0x0xFFFFF) solving possible wifi errors
     2 = Erase Tasmota parameter area (0x0xF3xxx - 0x0xFBFFF)
     3 = Erase Tasmota and SDK parameter area (0x0F3xxx - 0x0FFFFF)
+    4 = Erase SDK parameter area used for wifi calibration (0x0FCxxx - 0x0FCFFF)
   */
 
 #ifndef FIRMWARE_MINIMAL
@@ -745,8 +770,22 @@ void SettingsErase(uint8_t type)
     _sectorStart = SETTINGS_LOCATION - CFG_ROTATES;                       // Tasmota and SDK parameter area (0x0F3xxx - 0x0FFFFF)
     _sectorEnd = ESP.getFlashChipSize() / SPI_FLASH_SEC_SIZE;             // Flash size as seen by SDK
   }
+  else if (4 == type) {
+//    _sectorStart = (ESP.getFlashChipSize() / SPI_FLASH_SEC_SIZE) - 4;     // SDK phy area and Core calibration sector (0x0FC000)
+    _sectorStart = SETTINGS_LOCATION +1;                                  // SDK phy area and Core calibration sector (0x0FC000)
+    _sectorEnd = _sectorStart +1;                                         // SDK end of phy area and Core calibration sector (0x0FCFFF)
+  }
+/*
+  else if (5 == type) {
+    _sectorStart = (ESP.getFlashChipRealSize() / SPI_FLASH_SEC_SIZE) -4;  // SDK phy area and Core calibration sector (0xxFC000)
+    _sectorEnd = _sectorStart +1;                                         // SDK end of phy area and Core calibration sector (0xxFCFFF)
+  }
+*/
+  else {
+    return;
+  }
 
-  AddLog_P2(LOG_LEVEL_DEBUG, PSTR(D_LOG_APPLICATION D_ERASE " %d " D_UNIT_SECTORS), _sectorEnd - _sectorStart);
+  AddLog_P2(LOG_LEVEL_DEBUG, PSTR(D_LOG_APPLICATION D_ERASE " from 0x%08X to 0x%08X"), _sectorStart * SPI_FLASH_SEC_SIZE, (_sectorEnd * SPI_FLASH_SEC_SIZE) -1);
 
 //  EspErase(_sectorStart, _sectorEnd);                                     // Arduino core and SDK - erases flash as seen by SDK
   EsptoolErase(_sectorStart, _sectorEnd);                                 // Esptool - erases flash completely
@@ -755,7 +794,7 @@ void SettingsErase(uint8_t type)
 
 void SettingsSdkErase(void)
 {
-  WiFi.disconnect(true);    // Delete SDK wifi config
+  WiFi.disconnect(false);    // Delete SDK wifi config
   SettingsErase(1);
   delay(1000);
 }
@@ -1362,7 +1401,6 @@ void SettingsDelta(void)
       Settings.mqtt_port = Settings.ex_mqtt_port;              // 20A -> EFC
       memcpy((char*)&Settings.serial_config, (char*)&Settings.ex_serial_config, 5);  // 1E4 -> EFE
     }
-
     if (Settings.version < 0x08000000) {
       char temp[strlen(Settings.text_pool) +1];           strncpy(temp, Settings.text_pool, sizeof(temp));  // Was ota_url
       char temp21[strlen(Settings.ex_mqtt_prefix[0]) +1]; strncpy(temp21, Settings.ex_mqtt_prefix[0], sizeof(temp21));
@@ -1433,6 +1471,9 @@ void SettingsDelta(void)
       SettingsUpdateText(SET_FRIENDLYNAME2, Settings.ex_friendlyname[1]);
       SettingsUpdateText(SET_FRIENDLYNAME3, Settings.ex_friendlyname[2]);
       SettingsUpdateText(SET_FRIENDLYNAME4, Settings.ex_friendlyname[3]);
+    }
+    if (Settings.version < 0x08020003) {
+      SettingsUpdateText(SET_TEMPLATE_NAME, Settings.user_template_name);
     }
 
     Settings.version = VERSION;
